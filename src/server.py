@@ -1,25 +1,35 @@
-from websockets.asyncio.server import broadcast, serve, ServerConnection
+from websockets import serve, broadcast
 
-class Server:
+class WebSocketManager:
 
-    def __init__(self):
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.connections = set()
         self.server = None
 
-    async def handler(self, websocket: ServerConnection , path):
-        print('New client connected to server')
+    async def run(self):
+        self.server = await serve(self.handler, self.host, self.port)
+        await self.server.serve_forever()
+
+    async def stop(self):
+        if self.serve is not None:
+            await self.server.close()
+
+    async def register(self, websocket):
+        self.connections.add(websocket)
+        print(f"Client connected: {websocket}")
+
+    async def unregister(self, websocket):
+        self.connections.remove(websocket)
+        print(f"Client disconnected: {websocket}")
+
+    async def broadcast(self, message):
+        broadcast(self.connections, message)
+
+    async def handler(self, websocket, path):
+        await self.register(websocket)
         try:
             await websocket.wait_closed()
         finally:
-            print('Client disconnected from server')
-
-    async def broadcast_message(self, message):
-        print(f'Relaying message {message.id} to all clients')
-        broadcast(self.server.connections, message)
-
-    async def serve(self, host, port):
-        print('Starting server...')
-        self.server = await serve(self.handler, host, port)
-        await self.server.wait_closed()
-
-    async def close(self):
-        self.server.close()
+            await self.unregister(websocket)
