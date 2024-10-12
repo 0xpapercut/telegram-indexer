@@ -62,7 +62,7 @@ class DatabaseManager:
         text,
         date
     ):
-        logging.info('Queueing insert to messages table')
+        # logging.info('Queueing insert to messages table')
         insertion_time = datetime.datetime.now()
         await self.insert_queue.put(('messages', (message_id, user_id, chat_id, text, date, insertion_time)))
 
@@ -78,7 +78,7 @@ class DatabaseManager:
         is_fake,
         is_verified,
     ):
-        logging.info('Queueing insert to users table')
+        # logging.info('Queueing insert to users table')
         await self.insert_queue.put(('users', (user_id, username, first_name, last_name, is_bot, is_premium, is_scam, is_fake, is_verified)))
 
     async def insert_chat(
@@ -90,8 +90,12 @@ class DatabaseManager:
         is_user,
         message_id_cursor=None
     ):
-        logging.info('Queueing insert to chats table')
+        # logging.info('Queueing insert to chats table')
         await self.insert_queue.put(('chats', (chat_id, title, is_group, is_channel, is_user, message_id_cursor)))
+
+    async def insert_participants_count(self, chat_id, participants_count, api_time):
+        logging.info('Queueing insert to chats_participants_count table')
+        await self.insert_queue.put(('chats_participants_count', (chat_id, participants_count, api_time)))
 
     async def _execute_insert_queue(self):
         all_inserts = {}
@@ -109,6 +113,8 @@ class DatabaseManager:
                             await cursor.executemany('INSERT OR IGNORE INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', all_values)
                         elif key == 'chats':
                             await cursor.executemany('INSERT OR IGNORE INTO chats VALUES (?, ?, ?, ?, ?, ?)', all_values)
+                        elif key == 'chats_participants_count':
+                            await cursor.executemany('INSERT INTO chats_participants_count (chat_id, participants_count, api_time) VALUES (?, ?, ?)', all_values)
                         else:
                             raise ValueError("Unknown table")
                     except aiosqlite.ProgrammingError as e:

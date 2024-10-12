@@ -25,7 +25,7 @@ DEFAULT_HOST = 'localhost'
 DEFAULT_PORT = 5123
 
 logging.basicConfig(
-    level=logging.WARN,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
@@ -65,15 +65,29 @@ class TelegramManager:
         await self.websocket.stop()
 
     async def main_loop(self):
-        scheduler_task = asyncio.create_task(self.chat_processing_scheduler_loop())
-        await scheduler_task
+        scheduler_loop = asyncio.create_task(self.chat_processing_scheduler_loop())
+        participants_count_loop = asyncio.create_task(self.chats_participants_count_loop())
+        await asyncio.wait([participants_count_loop])
+
+    async def chats_participants_count_loop(self):
+        logging.info('Loop is here...')
+        while True:
+            async for dialog in self.client.iter_dialogs():
+                if isinstance(dialog.entity, types.User):
+                    continue
+                logging.warn(f'Treating {dialog.title}')
+                participants_count = dialog.entity.participants_count
+                chat_id = dialog.entity.id
+                await self.database.insert_participants_count(chat_id, participants_count, datetime.datetime.now())
+            logging.warn('Sleeping for 30 seconds...')
+            await asyncio.sleep(30)
 
     async def new_message_handler(self, event):
         message = event.message
         chat = message.chat
         sender = message.sender
 
-        # self.live.update(Text(f"Last new message received at {datetime.datetime.now()}"))
+        logging.info(f'Last message received at {datetime.datetime.now()}')
 
         if message is None:
             return
@@ -170,8 +184,11 @@ class TelegramManager:
             if last_message:
                 await self.database.set_chat_message_id_cursor(message.chat_id, message.id)
 
-    async def _get_full_chat(self, channel):
-        return await self.client(GetFullChannelRequest(channel))
+    # async def _get_full_chat(self, channel):
+    #     return await self.client(GetFullChannelRequest(channel))
+
+    # async def _get_number_of_participants(self, channel):
+    #     return (await self._get_full_chat(channel))
 
     async def _get_total_number_of_messages(self, chat_id):
         return (await self.client.get_messages(chat_id, search='')).total
