@@ -38,3 +38,19 @@ CREATE TABLE chats_participants_count(
     insertion_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
 );
+
+CREATE VIEW messages_with_details AS
+SELECT
+    m.message_id,
+    m.text,
+    u.username,
+    c.title AS chat_title,
+    m.date
+FROM
+    messages m
+JOIN
+    users u ON m.sender_id = u.user_id
+JOIN
+    chats c ON m.chat_id = c.chat_id
+ORDER BY
+    m.date DESC;
