@@ -14,6 +14,7 @@ class WebSocketManager:
 
     async def run(self):
         self.server = await serve(self.handler, self.host, self.port)
+        print(f'Serving at {self.host}:{self.port}')
         await self.server.serve_forever()
 
     async def stop(self):
