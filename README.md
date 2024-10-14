@@ -1,5 +1,5 @@
-# telegram-db
-Sink Telegram into SQLite.
+# telegram-indexer
+Index Telegram messages with PostgreSQL.
 
 ## Setup
 1. Define the `API_HASH` and `API_ID` environment variables.
