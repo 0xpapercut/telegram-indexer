@@ -1,133 +1,285 @@
-import os
-import aiosqlite
+import asyncpg
 import asyncio
-import datetime
 import logging
+from dataclasses import dataclass
+from datetime import datetime
+
+from telethon import events, types
+from telethon.tl import patched
+
+from .utils import get_username
 
 class DatabaseManager:
-    def __init__(self, path):
-        self.lock = asyncio.Lock()
-        self.path = path
-        self.insert_queue = asyncio.Queue()
+
+    def __init__(self, dsn):
+        self.dsn = dsn
+        self.pool = None
+        self._insert_queue = asyncio.Queue()
+        self.batch_wait_time = 1
         self.stop_event = asyncio.Event()
-        self.loop_task = None
 
-    async def _create_tables(self):
-        async with self.lock, aiosqlite.connect(self.path) as conn:
-            with open('schema.sql', 'r') as schema_file:
-                schema_sql = schema_file.read()
-                await conn.executescript(schema_sql)
-            await conn.commit()
+    async def run(self):
+        self.pool = await asyncpg.create_pool(self.dsn)
+        while True:
+            await self.batch_insert_from_queue()
+            await self.sleep()
 
-    async def _loop(self):
-        while not self.stop_event.is_set():
-            await self._execute_insert_queue()
-            await asyncio.sleep(1)
-        await self._execute_insert_queue()
-
-    async def get_total_number_of_messages(self, chat_id):
-        async with self.lock, aiosqlite.connect(self.path) as conn:
-            async with conn.execute('SELECT COUNT(*) FROM messages WHERE chat_id = ?', (chat_id,)) as cursor:
-                result = await cursor.fetchone()
-                return result[0] if result else 0
-
-    async def get_chat_message_id_cursor(self, chat_id):
-        async with self.lock, aiosqlite.connect(self.path) as conn:
-            async with conn.execute('SELECT message_id_cursor FROM chats WHERE chat_id = ?', (chat_id,)) as cursor:
-                result = await cursor.fetchone()
-                return result[0] if result else None
-
-    async def start(self):
-        logging.info('Starting DatabaseManager')
-        if not os.path.exists(os.path.dirname(self.path)):
-            logging.info(f'{self.path} does not exist. Creating...')
-            os.makedirs(os.path.dirname(self.path))
-        if not os.path.exists(self.path):
-            logging.info('No database detected. Creating...')
-            await self._create_tables()
-        else:
-            logging.info('Database detected')
-        self.loop_task = asyncio.create_task(self._loop())
-
-    async def stop(self):
+    def stop(self):
         self.stop_event.set()
-        if self.loop_task:
-            await self.loop_task
 
-    async def insert_message(
-        self,
-        message_id,
-        user_id,
-        chat_id,
-        text,
-        date
-    ):
-        # logging.info('Queueing insert to messages table')
-        insertion_time = datetime.datetime.now()
-        await self.insert_queue.put(('messages', (message_id, user_id, chat_id, text, date, insertion_time)))
+    async def get_latest_historical_message_id(self, chat_id):
+        async with self.pool.acquire() as conn:
+            try:
+                row = await conn.fetchrow("""
+                    SELECT latest_historical_message_id
+                    FROM chats
+                    WHERE chat_id = $1
+                    LIMIT 1
+                """, chat_id)
+                return row['latest_historical_message_id']
+            except asyncpg.PostgresError as e:
+                logging.error(f'PostgreSQL error during query on chats table: {e}')
 
-    async def insert_user(
-        self,
-        user_id,
-        username,
-        first_name,
-        last_name,
-        is_bot,
-        is_premium,
-        is_scam,
-        is_fake,
-        is_verified,
-    ):
-        # logging.info('Queueing insert to users table')
-        await self.insert_queue.put(('users', (user_id, username, first_name, last_name, is_bot, is_premium, is_scam, is_fake, is_verified)))
+    async def get_all_latest_message_ids(self):
+        async with self.pool.acquire() as conn:
+            try:
+                return await conn.fetch('''
+                    SELECT a.chat_id,
+                        MAX(b.message_id) AS latest_message_id,
+                        a.latest_historical_message_id
+                    FROM chats a
+                    LEFT JOIN messages b ON a.chat_id = b.chat_id
+                    GROUP BY a.chat_id, a.latest_historical_message_id
+                ''')
+            except asyncpg.PostgresError as e:
+                logging.error(f'PostgreSQL error during query on chats table: {e}')
 
-    async def insert_chat(
-        self,
-        chat_id,
-        title,
-        is_group,
-        is_channel,
-        is_user,
-        message_id_cursor=None
-    ):
-        # logging.info('Queueing insert to chats table')
-        await self.insert_queue.put(('chats', (chat_id, title, is_group, is_channel, is_user, message_id_cursor)))
+    async def get_historical_message_count(self, chat_id):
+        async with self.pool.acquire() as conn:
+            try:
+                row = await conn.fetchrow('''
+                    SELECT COUNT(*) AS count
+                    FROM messages
+                    WHERE chat_id = $1 AND is_historical = true
+                ''', chat_id)
+                return row['count']
+            except asyncpg.PostgresError as e:
+                logging.error(f'PostgreSQL error during query on messages table: {e}')
 
-    async def insert_participants_count(self, chat_id, participants_count, api_time):
-        logging.info('Queueing insert to chats_participants_count table')
-        await self.insert_queue.put(('chats_participants_count', (chat_id, participants_count, api_time)))
+    async def get_chat_title(self, chat_id):
+        async with self.pool.acquire() as conn:
+            try:
+                row = await conn.fetchrow("""
+                    SELECT title
+                    FROM chats
+                    WHERE chat_id = $1
+                """, chat_id)
+                return row['title']
+            except asyncpg.PostgresError as e:
+                logging.error(f'PostgreSQL error during query on chats table: {e}')
 
-    async def _execute_insert_queue(self):
-        all_inserts = {}
-        while not self.insert_queue.empty():
-            table, values = await self.insert_queue.get()
-            all_inserts.setdefault(table, []).append(values)
+    async def sleep(self):
+        await asyncio.sleep(self.batch_wait_time)
+        # tasks = [asyncio.create_task(asyncio.sleep(delay)), asyncio.create_task(self.stop_event.wait())]
+        # done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        # await done
+        # for task in pending:
+        #     task.cancel()
 
-        async with self.lock, aiosqlite.connect(self.path) as conn:
-            async with conn.cursor() as cursor:
-                for key, all_values in all_inserts.items():
-                    try:
-                        if key == 'messages':
-                            await cursor.executemany('INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?, ?, ?)', all_values)
-                        elif key == 'users':
-                            await cursor.executemany('INSERT OR IGNORE INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', all_values)
-                        elif key == 'chats':
-                            await cursor.executemany('INSERT OR IGNORE INTO chats VALUES (?, ?, ?, ?, ?, ?)', all_values)
-                        elif key == 'chats_participants_count':
-                            await cursor.executemany('INSERT INTO chats_participants_count (chat_id, participants_count, api_time) VALUES (?, ?, ?)', all_values)
-                        else:
-                            raise ValueError("Unknown table")
-                    except aiosqlite.ProgrammingError as e:
-                        logging.error(f'SQLite error: {e}')
-                await conn.commit()
+    async def queue_insert(self, item):
+        if item is not None:
+            await self._insert_queue.put(item)
 
-    async def set_chat_message_id_cursor(self, chat_id, message_id):
-        async with self.lock, aiosqlite.connect(self.path) as conn:
-            async with conn.cursor() as cursor:
-                await cursor.execute('''
-                    INSERT INTO chats (chat_id, message_id_cursor)
-                    VALUES (?, ?)
-                    ON CONFLICT(chat_id) DO UPDATE SET
-                    message_id_cursor=excluded.message_id_cursor
-                ''', (chat_id, message_id))
-                await conn.commit()
+    async def batch_insert_from_queue(self):
+        users = []
+        chats = []
+        messages = []
+        chats_participants_count = []
+        while not self._insert_queue.empty():
+            item =  await self._insert_queue.get()
+            if isinstance(item, UserRow):
+                users.append(item)
+            elif isinstance(item, ChatRow):
+                chats.append(item)
+            elif isinstance(item, MessageRow):
+                messages.append(item)
+            elif isinstance(item, ChatParticipantsCountRow):
+                chats_participants_count.append(item)
+        if users:
+            await self.batch_insert_users(users)
+        if chats:
+            await self.batch_insert_chats(chats)
+        if messages:
+            await self.batch_insert_messages(messages)
+        if chats_participants_count:
+            await self.batch_insert_chats_participants_count(chats_participants_count)
+
+    async def batch_insert_users(self, users: list['UserRow']):
+        async with self.pool.acquire() as conn:
+            try:
+                await conn.executemany("""
+                    INSERT INTO users (user_id, username, first_name, last_name, is_bot, is_premium, is_scam, is_fake, is_verified)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    ON CONFLICT (user_id) DO NOTHING
+                """, [(row.user_id, row.username, row.first_name, row.last_name, row.is_bot, row.is_premium, row.is_scam, row.is_fake, row.is_verified) for row in users])
+            except asyncpg.PostgresError as e:
+                logging.error(f'PostgreSQL error during user insertion: {e}')
+
+    async def batch_insert_chats(self, chats: list['ChatRow']):
+        async with self.pool.acquire() as conn:
+            try:
+                await conn.executemany(f"""
+                    INSERT INTO chats (chat_id, title, is_group, is_channel, is_user)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (chat_id) DO NOTHING
+                """, [(row.chat_id, row.title, row.is_group, row.is_channel, row.is_user) for row in chats])
+            except asyncpg.PostgresError as e:
+                logging.error(f'PostgreSQL error during chat insertion: {e}')
+
+    async def batch_insert_messages(self, messages: list['MessageRow']):
+        async with self.pool.acquire() as conn:
+            try:
+                await conn.executemany("""
+                    INSERT INTO messages (message_id, sender_id, chat_id, text, date, is_historical)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (chat_id, message_id) DO UPDATE SET is_historical = EXCLUDED.is_historical
+                    WHERE messages.is_historical = false AND EXCLUDED.is_historical = true
+                """, [(row.message_id, row.sender_id, row.chat_id, row.text, row.date, row.is_historical) for row in messages])
+            except asyncpg.PostgresError as e:
+                logging.error(f'PostgreSQL error during message insertion: {e}')
+
+    async def batch_insert_chats_participants_count(self, chats_participants_count: list['ChatParticipantsCountRow']):
+        async with self.pool.acquire() as conn:
+            try:
+                await conn.executemany("""
+                    INSERT INTO chats_participants_count (chat_id, participants_count)
+                    VALUES ($1, $2)
+                """, [(row.chat_id, row.participants_count) for row in chats_participants_count])
+            except asyncpg.PostgresError as e:
+                logging.error(f'PostgreSQL error during chat_participants_count insertion: {e}')
+
+@dataclass
+class MessageRow:
+    message_id: int
+    sender_id: int
+    chat_id: int
+    text: str
+    date: datetime
+    is_historical: bool
+
+    @classmethod
+    async def from_new_message_event(cls, event: events.NewMessage.Event):
+        return await cls.from_patched_message(event.message)
+        # return cls(
+        #     message_id=event.message.id,
+        #     sender_id=event.message.sender_id,
+        #     text=event.message.text,
+        #     date=event.date,
+        #     is_historical=False,
+        # )
+
+    @classmethod
+    async def from_patched_message(cls, message: patched.Message, is_historical=False):
+        return cls(
+            chat_id=message.chat_id,
+            message_id=message.id,
+            sender_id=message.sender_id,
+            text=message.text,
+            date=message.date.replace(tzinfo=None),
+            is_historical=is_historical,
+        )
+
+@dataclass
+class UserRow:
+    user_id: int
+    username: str
+    first_name: str
+    last_name: str
+    is_bot: bool
+    is_premium: bool
+    is_scam: bool
+    is_fake: bool
+    is_verified: bool
+
+    @classmethod
+    async def from_new_message_event(cls, event: events.NewMessage.Event):
+        return await cls.from_patched_message(event.message)
+        # sender = await event.message.get_sender()
+        # if isinstance(sender, types.User):
+        #     return cls(
+        #         user_id=sender.id,
+        #         username=get_username(sender),
+        #         first_name=sender.first_name,
+        #         last_name=sender.last_name,
+        #         is_bot=sender.bot,
+        #         is_premium=sender.premium,
+        #         is_scam=sender.scam,
+        #         is_fake=sender.fake,
+        #         is_verified=sender.verified,
+        #     )
+        # else: # sender is Channel
+        #     pass
+
+    @classmethod
+    async def from_patched_message(cls, message: patched.Message):
+        sender = await message.get_sender()
+        if isinstance(sender, types.User):
+            return cls(
+                user_id=sender.id,
+                username=get_username(sender),
+                first_name=sender.first_name,
+                last_name=sender.last_name,
+                is_bot=sender.bot,
+                is_premium=sender.premium,
+                is_scam=sender.scam,
+                is_fake=sender.fake,
+                is_verified=sender.verified,
+            )
+        else: # sender is Channel
+            pass
+
+@dataclass
+class ChatRow:
+    chat_id: int
+    title: int
+    is_group: bool
+    is_channel: bool
+    is_user: bool
+
+    @classmethod
+    async def from_new_message_event(cls, event: events.NewMessage.Event):
+        chat = await event.get_chat()
+        is_user = isinstance(chat, types.User)
+        title = chat.title if not is_user else get_username(chat)
+        if is_user: logging.error('Tis a user!!')
+        return cls(
+            chat_id=event.chat_id,
+            title=title,
+            is_group=event.is_group,
+            is_channel=event.is_channel,
+            is_user=is_user,
+        )
+
+    @classmethod
+    async def from_dialog(cls, dialog: types.Dialog):
+        title = dialog.entity.title if not dialog.is_user else get_username(dialog.entity)
+        return cls(
+            chat_id=dialog.id,
+            title=title,
+            is_group=dialog.is_group,
+            is_channel=dialog.is_channel,
+            is_user=dialog.is_user
+        )
+
+@dataclass
+class ChatParticipantsCountRow:
+    chat_id: int
+    participants_count: int
+
+    @classmethod
+    async def from_dialog(cls, dialog: types.Dialog):
+        if not dialog.is_user:
+            return cls(
+                chat_id=dialog.id,
+                participants_count=dialog.entity.participants_count,
+            )
