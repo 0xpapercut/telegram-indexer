@@ -17,6 +17,7 @@ class DatabaseManager:
         self._insert_queue = asyncio.Queue()
         self.batch_wait_time = 1
         self.stop_event = asyncio.Event()
+        self.logger = logging.getLogger('database')
 
     async def run(self):
         self.pool = await asyncpg.create_pool(self.dsn)
@@ -40,7 +41,7 @@ class DatabaseManager:
                 """, chat_id)
                 return row
             except asyncpg.PostgresError as e:
-                logging.error(f'PostgreSQL error during query on chats table: {e}')
+                self.logger.error(f'PostgreSQL error during query on chats table: {e}')
 
     async def get_all_latest_message_ids(self):
         async with self.pool.acquire() as conn:
@@ -54,7 +55,7 @@ class DatabaseManager:
                     GROUP BY chat_id
                 ''')
             except asyncpg.PostgresError as e:
-                logging.error(f'PostgreSQL error during query on chats table: {e}')
+                self.logger.error(f'PostgreSQL error during query on chats table: {e}')
 
     async def get_historical_message_count(self, chat_id):
         async with self.pool.acquire() as conn:
@@ -66,7 +67,7 @@ class DatabaseManager:
                 ''', chat_id)
                 return row['count']
             except asyncpg.PostgresError as e:
-                logging.error(f'PostgreSQL error during query on messages table: {e}')
+                self.logger.error(f'PostgreSQL error during query on messages table: {e}')
 
     async def get_chat_title(self, chat_id):
         async with self.pool.acquire() as conn:
@@ -78,7 +79,7 @@ class DatabaseManager:
                 """, chat_id)
                 return row['title']
             except asyncpg.PostgresError as e:
-                logging.error(f'PostgreSQL error during query on chats table: {e}')
+                self.logger.error(f'PostgreSQL error during query on chats table: {e}')
 
     async def sleep(self):
         await asyncio.sleep(self.batch_wait_time)
@@ -125,7 +126,7 @@ class DatabaseManager:
                     ON CONFLICT (user_id) DO NOTHING
                 """, [(row.user_id, row.username, row.first_name, row.last_name, row.is_bot, row.is_premium, row.is_scam, row.is_fake, row.is_verified) for row in users])
             except asyncpg.PostgresError as e:
-                logging.error(f'PostgreSQL error during user insertion: {e}')
+                self.logger.error(f'PostgreSQL error during user insertion: {e}')
 
     async def batch_insert_chats(self, chats: list['ChatRow']):
         async with self.pool.acquire() as conn:
@@ -136,7 +137,7 @@ class DatabaseManager:
                     ON CONFLICT (chat_id) DO NOTHING
                 """, [(row.chat_id, row.title, row.is_group, row.is_channel, row.is_user) for row in chats])
             except asyncpg.PostgresError as e:
-                logging.error(f'PostgreSQL error during chat insertion: {e}')
+                self.logger.error(f'PostgreSQL error during chat insertion: {e}')
 
     async def batch_insert_messages(self, messages: list['MessageRow']):
         async with self.pool.acquire() as conn:
@@ -148,7 +149,7 @@ class DatabaseManager:
                     WHERE messages.is_historical = false AND EXCLUDED.is_historical = true
                 """, [(row.message_id, row.sender_id, row.chat_id, row.text, row.date, row.is_historical) for row in messages])
             except asyncpg.PostgresError as e:
-                logging.error(f'PostgreSQL error during message insertion: {e}')
+                self.logger.error(f'PostgreSQL error during message insertion: {e}')
 
     async def batch_insert_chats_participants_count(self, chats_participants_count: list['ChatParticipantsCountRow']):
         async with self.pool.acquire() as conn:
@@ -158,7 +159,7 @@ class DatabaseManager:
                     VALUES ($1, $2)
                 """, [(row.chat_id, row.participants_count) for row in chats_participants_count])
             except asyncpg.PostgresError as e:
-                logging.error(f'PostgreSQL error during chat_participants_count insertion: {e}')
+                self.logger.error(f'PostgreSQL error during chat_participants_count insertion: {e}')
 
 @dataclass
 class MessageRow:
@@ -171,25 +172,22 @@ class MessageRow:
 
     @classmethod
     async def from_new_message_event(cls, event: events.NewMessage.Event):
+        if event.date:
+            assert event.message.date is not None
         return await cls.from_patched_message(event.message)
-        # return cls(
-        #     message_id=event.message.id,
-        #     sender_id=event.message.sender_id,
-        #     text=event.message.text,
-        #     date=event.date,
-        #     is_historical=False,
-        # )
 
     @classmethod
     async def from_patched_message(cls, message: patched.Message, is_historical=False):
-        return cls(
-            chat_id=message.chat_id,
-            message_id=message.id,
-            sender_id=message.sender_id,
-            text=message.text,
-            date=message.date.replace(tzinfo=None),
-            is_historical=is_historical,
-        )
+        sender = await message.get_sender()
+        if sender:
+            return cls(
+                chat_id=message.chat_id,
+                message_id=message.id,
+                sender_id=sender.id,
+                text=message.text,
+                date=message.date.replace(tzinfo=None),
+                is_historical=is_historical,
+            )
 
 @dataclass
 class UserRow:
@@ -206,21 +204,6 @@ class UserRow:
     @classmethod
     async def from_new_message_event(cls, event: events.NewMessage.Event):
         return await cls.from_patched_message(event.message)
-        # sender = await event.message.get_sender()
-        # if isinstance(sender, types.User):
-        #     return cls(
-        #         user_id=sender.id,
-        #         username=get_username(sender),
-        #         first_name=sender.first_name,
-        #         last_name=sender.last_name,
-        #         is_bot=sender.bot,
-        #         is_premium=sender.premium,
-        #         is_scam=sender.scam,
-        #         is_fake=sender.fake,
-        #         is_verified=sender.verified,
-        #     )
-        # else: # sender is Channel
-        #     pass
 
     @classmethod
     async def from_patched_message(cls, message: patched.Message):
@@ -253,7 +236,6 @@ class ChatRow:
         chat = await event.get_chat()
         is_user = isinstance(chat, types.User)
         title = chat.title if not is_user else get_username(chat)
-        if is_user: logging.error('Tis a user!!')
         return cls(
             chat_id=event.chat_id,
             title=title,
