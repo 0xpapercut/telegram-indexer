@@ -15,8 +15,7 @@ CREATE TABLE chats (
     title TEXT,
     is_group BOOLEAN,
     is_channel BOOLEAN,
-    is_user BOOLEAN,
-    latest_historical_message_id message_id BIGINT NULL,
+    is_user BOOLEAN
 );
 
 CREATE TABLE messages (
