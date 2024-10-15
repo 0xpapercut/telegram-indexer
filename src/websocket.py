@@ -1,8 +1,6 @@
 import logging
-from dataclasses import dataclass
 from websockets import serve, broadcast
-from telethon import events
-
+from rich.json import JSON
 
 class WebSocketManager:
 
@@ -30,7 +28,9 @@ class WebSocketManager:
         print(f"Client disconnected: {websocket}")
 
     async def broadcast(self, message: str):
-        logging.info(f'Broadcasting message {message}')
+        formatted_message = JSON(message, indent=None).text
+        formatted_message.truncate(max_width=120)
+        logging.info(f'Broadcasting message {formatted_message}')
         broadcast(self.connections, message)
 
     async def handler(self, websocket, path):
