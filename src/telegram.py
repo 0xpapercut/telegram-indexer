@@ -2,15 +2,14 @@ import asyncio
 import logging
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 
-from telethon import TelegramClient, events, types
-from rich.progress_bar import ProgressBar
+from telethon import TelegramClient, events
 from rich.progress import Progress
 
 from .database import DatabaseManager, UserRow, ChatRow, MessageRow, ChatParticipantsCountRow
 from .websocket import WebSocketManager
 from .utils import get_full_name
+from .rich_utils import MessagesPerSecondColumn
 
 class TelegramManager:
 
@@ -27,7 +26,9 @@ class TelegramManager:
         self.get_chat_historical_messages_queue = asyncio.Queue()
         self.get_chat_historical_message_schedule_set = set()
         self.get_chat_historical_messages_wait_time = 1
+
         self.iter_dialogs_loop_wait_time = 20
+        self.iter_dialogs_first_pass_event = asyncio.Event()
 
         self.stop_event = asyncio.Event()
 
@@ -53,12 +54,20 @@ class TelegramManager:
         historical_messages_task = asyncio.create_task(self.get_chat_historical_messages_loop())
         dialog_task = asyncio.create_task(self.iter_dialogs_loop())
 
+        logging.info('Waiting for iter dialogs first pass')
+        await self.iter_dialogs_first_pass_event.wait()
+        await asyncio.sleep(1) # Wait for one extra second before making queries on the database
+
+        logging.info('Starting main loop')
         while True:
             rows = await self.database.get_all_latest_message_ids()
             for row in rows:
                 if row['latest_historical_message_id'] is None or row['latest_message_id'] > row['latest_historical_message_id']:
-                    self.get_chat_historical_message_schedule_set.add(row['chat_id'])
-                    await self.get_chat_historical_messages_queue.put(row['chat_id'])
+                    if row['chat_id'] not in self.get_chat_historical_message_schedule_set:
+                        chat_title = await self.database.get_chat_title(row['chat_id'])
+                        logging.info(f'Inserting chat \'{chat_title}\' into processing queue')
+                        self.get_chat_historical_message_schedule_set.add(row['chat_id'])
+                        await self.get_chat_historical_messages_queue.put(row['chat_id'])
             await asyncio.sleep(60)
 
         await asyncio.gather(historical_messages_task, dialog_task)
@@ -69,26 +78,41 @@ class TelegramManager:
             async for dialog in self.client.iter_dialogs():
                 if chat := await ChatRow.from_dialog(dialog):
                     await self.database.queue_insert(chat)
-                # logging.info(f'Adding {chat} to chats')
                 if user := await UserRow.from_patched_message(dialog.message):
                     await self.database.queue_insert(user)
                 if message := await MessageRow.from_patched_message(dialog.message):
                     await self.database.queue_insert(message)
                 if chat_participants_count := await ChatParticipantsCountRow.from_dialog(dialog):
                     await self.database.queue_insert(chat_participants_count)
+            if not self.iter_dialogs_first_pass_event.is_set():
+                logging.info('Finished looping through dialogs. Setting off first pass event')
+                self.iter_dialogs_first_pass_event.set()
             await asyncio.sleep(self.iter_dialogs_loop_wait_time)
 
     async def get_chat_historical_messages_loop(self):
         while True:
             chat_id = await self.get_chat_historical_messages_queue.get()
+            chat_title = await self.database.get_chat_title(chat_id)
+            logging.info(f'Popped chat {chat_title} from processing queue')
+
             self.get_chat_historical_message_schedule_set.remove(chat_id)
-            logging.info(f'Processing historical information for chat {chat_id}')
-            min_id = await self.database.get_latest_historical_message_id(chat_id) or 0
+            if row := await self.database.get_latest_historical_message(chat_id):
+                min_id = row['message_id']
+                logging.info(f'Processing historical information for chat \'{chat_title}\' from {row['date']}')
+            else:
+                min_id = 0
+                logging.info(f'Processing historical information for chat \'{chat_title}\' from inception')
+
             wait_time = self.get_chat_historical_messages_wait_time
+
             total_messages = await self.get_total_number_of_messages(chat_id)
             remaining_messages = total_messages - await self.database.get_historical_message_count(chat_id)
-            with Progress() as progress:
-                task = progress.add_task(f"[cyan]Processing chat '{await self.database.get_chat_title(chat_id)}'", total=remaining_messages)
+
+            if remaining_messages == 0:
+                continue
+
+            with Progress(*Progress.get_default_columns(), MessagesPerSecondColumn()) as progress:
+                task = progress.add_task(f"[cyan]Processing chat '{chat_title}'", total=remaining_messages)
                 async for message in self.client.iter_messages(chat_id, limit=None, reverse=True, min_id=min_id, wait_time=wait_time):
                     # We don't need to insert chat as it has already been inserted by iter_dialogs
                     if user := await UserRow.from_patched_message(message):
@@ -110,16 +134,6 @@ class TelegramManager:
 
     async def get_total_number_of_messages(self, chat_id):
         return (await self.client.get_messages(chat_id, search='')).total
-
-    # async def add_handle_to_historical_messages_loop(handle):
-    #     pass
-        # def handle(chat_title, total_messages, processed_messages)
-
-    # async def process_dialog(self, dialog):
-    #     pass
-
-    # async def process_patched_message(self, message):
-    #     pass
 
 @dataclass
 class SerializableMessage:

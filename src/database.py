@@ -27,16 +27,18 @@ class DatabaseManager:
     def stop(self):
         self.stop_event.set()
 
-    async def get_latest_historical_message_id(self, chat_id):
+    async def get_latest_historical_message(self, chat_id):
         async with self.pool.acquire() as conn:
             try:
                 row = await conn.fetchrow("""
-                    SELECT latest_historical_message_id
-                    FROM chats
-                    WHERE chat_id = $1
+                    SELECT
+                        message_id, date
+                    FROM messages
+                    WHERE chat_id = $1 AND is_historical = true
+                    ORDER BY message_id DESC
                     LIMIT 1
                 """, chat_id)
-                return row['latest_historical_message_id']
+                return row
             except asyncpg.PostgresError as e:
                 logging.error(f'PostgreSQL error during query on chats table: {e}')
 
@@ -44,12 +46,12 @@ class DatabaseManager:
         async with self.pool.acquire() as conn:
             try:
                 return await conn.fetch('''
-                    SELECT a.chat_id,
-                        MAX(b.message_id) AS latest_message_id,
-                        a.latest_historical_message_id
-                    FROM chats a
-                    LEFT JOIN messages b ON a.chat_id = b.chat_id
-                    GROUP BY a.chat_id, a.latest_historical_message_id
+                    SELECT
+                        chat_id,
+                        MAX(message_id) AS latest_message_id,
+                        MAX(CASE WHEN is_historical THEN message_id ELSE NULL END) AS latest_historical_message_id
+                    FROM messages
+                    GROUP BY chat_id
                 ''')
             except asyncpg.PostgresError as e:
                 logging.error(f'PostgreSQL error during query on chats table: {e}')

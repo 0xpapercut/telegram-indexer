@@ -2,16 +2,11 @@ import os
 import asyncio
 import logging
 
-from rich.progress import Progress, SpinnerColumn, ProgressColumn, TextColumn
-from rich.console import Console
-from rich.live import Live
-from rich.layout import Layout
-from rich.text import Text
+from rich.logging import RichHandler
 
 from .database import DatabaseManager
 from .websocket import WebSocketManager
 from .telegram import TelegramManager
-from .utils import async_enumerate
 
 API_ID = os.environ['API_ID']
 API_HASH = os.environ['API_HASH']
@@ -20,11 +15,13 @@ DEFAULT_HOST = 'localhost'
 DEFAULT_PORT = 5123
 
 logging.basicConfig(
+    # level=logging.WARN,
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('telegram_indexer.log')
+        # logging.StreamHandler(),
+        logging.FileHandler('telegram_indexer.log'),
+        RichHandler(logging.INFO),
     ]
 )
 
