@@ -22,7 +22,7 @@ from .rich_utils import MessagesPerSecondColumn
 class TelegramManager:
 
     def __init__(self, api_id, api_hash, database_manager: DatabaseManager, websocket_manager: WebSocketManager):
-        self.client = TelegramClient('user', api_id, api_hash)
+        self.client = TelegramClient('user', api_id, api_hash, connection_retries=None, request_retries=None)
         self.client.add_event_handler(self.new_message_handler, events.NewMessage)
 
         self.database = database_manager
